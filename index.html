@@ -218,16 +218,32 @@
   // tracking wants (or centred on frame when nothing is being tracked).
   const MIN_MANUAL_ZOOM = 1;
   const DIGITAL_MAX_ZOOM = 15; // digital-crop-only ceiling, used when hardware zoom isn't available
+  const DIGITAL_STACK_FACTOR = 5; // once hardware zoom saturates, allow this much extra digital crop stacked on top
   let MAX_MANUAL_ZOOM = DIGITAL_MAX_ZOOM;
   let manualZoom = 1;
 
   function setManualZoom(z) {
     manualZoom = clamp(z, MIN_MANUAL_ZOOM, MAX_MANUAL_ZOOM);
-    zoomReadout.textContent = manualZoom.toFixed(1) + 'x' + (hasHardwareZoom ? ' optical' : '');
+    const label = hasHardwareZoom
+      ? (manualZoom > hwZoomMax
+          ? manualZoom.toFixed(1) + 'x (' + hwZoomMax.toFixed(1) + 'x optical + digital)'
+          : manualZoom.toFixed(1) + 'x optical')
+      : manualZoom.toFixed(1) + 'x';
+    zoomReadout.textContent = label;
     if (hasHardwareZoom && currentTrack) {
+      // Saturate the real lens at its own max, then any zoom beyond that is
+      // handled as extra digital crop (see digitalZoomFactor()) — this is the
+      // same "optical + digital" stacking concept as the phone's own hybrid zoom.
       const target = clamp(manualZoom, hwZoomMin, hwZoomMax);
       currentTrack.applyConstraints({ advanced: [{ zoom: target }] }).catch(() => {});
     }
+  }
+
+  // How much EXTRA digital crop (on top of whatever the camera hardware is
+  // already showing) the current manualZoom level calls for.
+  function digitalZoomFactor() {
+    if (!hasHardwareZoom) return manualZoom;
+    return Math.max(1, manualZoom / hwZoomMax);
   }
 
   function zoomStep() {
@@ -326,7 +342,7 @@
       }
       zoomCapabilityEl.textContent = diagMsg;
 
-      MAX_MANUAL_ZOOM = hasHardwareZoom ? hwZoomMax : DIGITAL_MAX_ZOOM;
+      MAX_MANUAL_ZOOM = hasHardwareZoom ? hwZoomMax * DIGITAL_STACK_FACTOR : DIGITAL_MAX_ZOOM;
       setManualZoom(1);
 
       frameW = video.videoWidth;
@@ -407,7 +423,7 @@
       // is already zoomed in — don't crop again on top of that.
       const aspect = frameW / frameH;
       const minCropW = frameW * parseFloat(minCropFractionEl.value);
-      const digitalZoom = hasHardwareZoom ? 1 : manualZoom;
+      const digitalZoom = digitalZoomFactor();
       const targetW = clamp(frameW / digitalZoom, minCropW, frameW);
       const targetH = targetW / aspect;
       crop = {
@@ -481,7 +497,7 @@
     const pa = parseFloat(panSmoothingEl.value);
 
     const boxSize = Math.max(box.w, box.h);
-    const digitalZoom = hasHardwareZoom ? 1 : manualZoom;
+    const digitalZoom = digitalZoomFactor();
     const desiredW = clamp(boxSize / targetFrac / digitalZoom, minCropW, frameW);
     const desiredCx = box.x + box.w / 2;
     const desiredCy = box.y + box.h / 2;
