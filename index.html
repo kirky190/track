@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Zoom Tracker</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14171b;
+    --accent: #4ade80;
+    --text: #e6e8eb;
+    --muted: #8b93a1;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, Roboto, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 12px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin: 4px 0 12px; }
+  #stage {
+    position: relative;
+    width: 100%;
+    max-width: 640px;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  canvas#display { width: 100%; height: 100%; display: block; touch-action: none; }
+  #status {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--muted);
+    min-height: 18px;
+    text-align: center;
+  }
+  .controls {
+    width: 100%;
+    max-width: 640px;
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-top: 12px;
+  }
+  .row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  button {
+    background: #1e2329;
+    color: var(--text);
+    border: 1px solid #2a3038;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 14px;
+    flex: 1;
+    min-width: 110px;
+  }
+  button.primary { background: var(--accent); color: #0b0d10; font-weight: 600; border: none; }
+  .slider-row { margin-bottom: 10px; }
+  .slider-row label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 2px;
+  }
+  input[type="range"] { width: 100%; }
+</style>
+</head>
+<body>
+
+  <h1>Zoom Tracker</h1>
+
+  <div id="stage">
+    <canvas id="display"></canvas>
+  </div>
+  <div id="status">Loading vision engine…</div>
+
+  <div class="controls">
+    <div class="row">
+      <button id="startBtn" class="primary">Start camera</button>
+      <button id="flipBtn">Switch camera</button>
+      <button id="resetBtn">Reset tracking</button>
+    </div>
+
+    <div class="slider-row">
+      <label><span>Target box size</span><span id="v-target"></span></label>
+      <input type="range" id="targetFraction" min="0.05" max="0.6" step="0.01" value="0.28" />
+    </div>
+    <div class="slider-row">
+      <label><span>Pan smoothing</span><span id="v-pan"></span></label>
+      <input type="range" id="panSmoothing" min="0.02" max="0.6" step="0.01" value="0.18" />
+    </div>
+    <div class="slider-row">
+      <label><span>Zoom smoothing</span><span id="v-zoom"></span></label>
+      <input type="range" id="zoomSmoothing" min="0.02" max="0.6" step="0.01" value="0.12" />
+    </div>
+    <div class="slider-row">
+      <label><span>Max zoom-in</span><span id="v-min"></span></label>
+      <input type="range" id="minCropFraction" min="0.02" max="0.5" step="0.01" value="0.10" />
+    </div>
+  </div>
+
+  <!-- OpenCV.js — provides goodFeaturesToTrack + calcOpticalFlowPyrLK for the tracker -->
+  <script async src="https://docs.opencv.org/4.9.0/opencv.js" onload="onOpenCvLoad();"></script>
+
+  <script>
+  // ---------------------------------------------------------------------
+  // Zoom Tracker
+  //
+  // Tap any object on screen. It's tracked with sparse Lucas-Kanade
+  // optical flow (a set of trackable feature points inside the tapped
+  // region, followed frame to frame) and the view digitally crops/zooms
+  // so the object stays roughly centred and a constant on-screen size.
+  //
+  // Same control-loop design as the Python/Android versions — this file
+  // is the browser port, using OpenCV.js instead of OpenCV's CSRT tracker
+  // since optical flow ships in every standard opencv.js build.
+  // ---------------------------------------------------------------------
+
+  const video = document.createElement('video');
+  video.setAttribute('playsinline', ''); // required for iOS inline playback
+  video.muted = true;
+
+  const sourceCanvas = document.createElement('canvas'); // full-res, off-screen
+  const sourceCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+
+  const displayCanvas = document.getElementById('display');
+  const displayCtx = displayCanvas.getContext('2d');
+
+  const statusEl = document.getElementById('status');
+  const startBtn = document.getElementById('startBtn');
+  const flipBtn = document.getElementById('flipBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  const targetFractionEl = document.getElementById('targetFraction');
+  const panSmoothingEl = document.getElementById('panSmoothing');
+  const zoomSmoothingEl = document.getElementById('zoomSmoothing');
+  const minCropFractionEl = document.getElementById('minCropFraction');
+  const vTarget = document.getElementById('v-target');
+  const vPan = document.getElementById('v-pan');
+  const vZoom = document.getElementById('v-zoom');
+  const vMin = document.getElementById('v-min');
+
+  function refreshSliderLabels() {
+    vTarget.textContent = targetFractionEl.value;
+    vPan.textContent = panSmoothingEl.value;
+    vZoom.textContent = zoomSmoothingEl.value;
+    vMin.textContent = minCropFractionEl.value;
+  }
+  [targetFractionEl, panSmoothingEl, zoomSmoothingEl, minCropFractionEl].forEach(el =>
+    el.addEventListener('input', refreshSliderLabels)
+  );
+  refreshSliderLabels();
+
+  let cvReady = false;
+  let streaming = false;
+  let facingMode = 'environment'; // back camera by default
+  let frameW = 0, frameH = 0;
+
+  let tracking = false;
+  let prevGray = null;   // cv.Mat, kept between frames
+  let prevPts = null;    // cv.Mat (Nx1 CV_32FC2), kept between frames
+
+  // Crop window in SOURCE pixel coordinates.
+  let crop = { left: 0, top: 0, w: 0, h: 0 };
+
+  function onOpenCvLoad() {
+    cv['onRuntimeInitialized'] = () => {
+      cvReady = true;
+      statusEl.textContent = 'Ready — tap "Start camera"';
+    };
+  }
+
+  startBtn.addEventListener('click', startCamera);
+  flipBtn.addEventListener('click', () => {
+    facingMode = facingMode === 'environment' ? 'user' : 'environment';
+    if (streaming) startCamera();
+  });
+  resetBtn.addEventListener('click', resetTracking);
+
+  async function startCamera() {
+    if (!cvReady) {
+      statusEl.textContent = 'Still loading vision engine, one sec…';
+      return;
+    }
+    stopStream();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      frameW = video.videoWidth;
+      frameH = video.videoHeight;
+      sourceCanvas.width = frameW;
+      sourceCanvas.height = frameH;
+
+      const stageAspect = frameW / frameH;
+      displayCanvas.width = 640;
+      displayCanvas.height = Math.round(640 / stageAspect);
+
+      crop = { left: 0, top: 0, w: frameW, h: frameH };
+      resetTracking();
+      streaming = true;
+      statusEl.textContent = 'Tap an object to track it';
+      requestAnimationFrame(tick);
+    } catch (err) {
+      statusEl.textContent = 'Camera error: ' + err.message;
+    }
+  }
+
+  function stopStream() {
+    const s = video.srcObject;
+    if (s) s.getTracks().forEach(t => t.stop());
+    streaming = false;
+  }
+
+  function resetTracking() {
+    tracking = false;
+    if (prevGray) { prevGray.delete(); prevGray = null; }
+    if (prevPts) { prevPts.delete(); prevPts = null; }
+    if (frameW && frameH) crop = { left: 0, top: 0, w: frameW, h: frameH };
+  }
+
+  function tick() {
+    if (!streaming) return;
+    sourceCtx.drawImage(video, 0, 0, frameW, frameH);
+
+    let box = null;
+
+    if (tracking) {
+      box = stepOpticalFlow();
+      if (box) {
+        updateCropTowards(box);
+      } else {
+        statusEl.textContent = 'Lost object — tap it again to reacquire';
+        resetTracking();
+      }
+    }
+
+    render(box);
+    requestAnimationFrame(tick);
+  }
+
+  function stepOpticalFlow() {
+    const rgba = cv.imread(sourceCanvas);
+    const currGray = new cv.Mat();
+    cv.cvtColor(rgba, currGray, cv.COLOR_RGBA2GRAY);
+    rgba.delete();
+
+    const nextPts = new cv.Mat();
+    const status = new cv.Mat();
+    const err = new cv.Mat();
+    const winSize = new cv.Size(21, 21);
+    const criteria = new cv.TermCriteria(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01);
+
+    cv.calcOpticalFlowPyrLK(prevGray, currGray, prevPts, nextPts, status, err, winSize, 3, criteria);
+
+    const good = [];
+    for (let i = 0; i < status.rows; i++) {
+      if (status.data[i] === 1) {
+        good.push([nextPts.data32F[i * 2], nextPts.data32F[i * 2 + 1]]);
+      }
+    }
+
+    prevGray.delete();
+    prevGray = currGray;
+    prevPts.delete();
+    nextPts.delete();
+    status.delete();
+    err.delete();
+
+    if (good.length < 4) {
+      prevPts = null;
+      return null;
+    }
+
+    const xs = good.map(p => p[0]);
+    const ys = good.map(p => p[1]);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+
+    const flat = [];
+    good.forEach(p => flat.push(p[0], p[1]));
+    prevPts = cv.matFromArray(good.length, 1, cv.CV_32FC2, flat);
+
+    return {
+      x: minX, y: minY,
+      w: Math.max(maxX - minX, 10),
+      h: Math.max(maxY - minY, 10)
+    };
+  }
+
+  function updateCropTowards(box) {
+    const aspect = frameW / frameH;
+    const minCropW = frameW * parseFloat(minCropFractionEl.value);
+    const targetFrac = Math.max(parseFloat(targetFractionEl.value), 0.01);
+    const za = parseFloat(zoomSmoothingEl.value);
+    const pa = parseFloat(panSmoothingEl.value);
+
+    const boxSize = Math.max(box.w, box.h);
+    const desiredW = clamp(boxSize / targetFrac, minCropW, frameW);
+    const desiredCx = box.x + box.w / 2;
+    const desiredCy = box.y + box.h / 2;
+
+    const curCx = crop.left + crop.w / 2;
+    const curCy = crop.top + crop.h / 2;
+
+    const newW = crop.w + (desiredW - crop.w) * za;
+    const newH = newW / aspect;
+    const newCx = curCx + (desiredCx - curCx) * pa;
+    const newCy = curCy + (desiredCy - curCy) * pa;
+
+    let left = clamp(newCx - newW / 2, 0, Math.max(frameW - newW, 0));
+    let top = clamp(newCy - newH / 2, 0, Math.max(frameH - newH, 0));
+
+    crop = { left, top, w: newW, h: newH };
+  }
+
+  function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
+
+  function render(box) {
+    const dw = displayCanvas.width, dh = displayCanvas.height;
+    displayCtx.drawImage(
+      sourceCanvas,
+      crop.left, crop.top, crop.w, crop.h,
+      0, 0, dw, dh
+    );
+
+    if (tracking && box) {
+      const sx = dw / crop.w, sy = dh / crop.h;
+      const x = (box.x - crop.left) * sx;
+      const y = (box.y - crop.top) * sy;
+      const w = box.w * sx;
+      const h = box.h * sy;
+      displayCtx.strokeStyle = '#4ade80';
+      displayCtx.lineWidth = 3;
+      displayCtx.strokeRect(x, y, w, h);
+    } else if (!tracking) {
+      displayCtx.fillStyle = 'rgba(255,255,255,0.85)';
+      displayCtx.font = '16px sans-serif';
+      displayCtx.fillText('Tap an object to track it', 16, 28);
+    }
+  }
+
+  // ---- Tap / click to select an object -----------------------------------
+  displayCanvas.addEventListener('pointerdown', onTap);
+
+  function onTap(e) {
+    if (!streaming || !cvReady) return;
+    const rect = displayCanvas.getBoundingClientRect();
+    const viewX = ((e.clientX - rect.left) / rect.width) * displayCanvas.width;
+    const viewY = ((e.clientY - rect.top) / rect.height) * displayCanvas.height;
+
+    const scaleX = crop.w / displayCanvas.width;
+    const scaleY = crop.h / displayCanvas.height;
+    const srcX = crop.left + viewX * scaleX;
+    const srcY = crop.top + viewY * scaleY;
+
+    const boxSize = Math.max(frameW * 0.12, 50);
+    const x = clamp(srcX - boxSize / 2, 0, frameW - boxSize);
+    const y = clamp(srcY - boxSize / 2, 0, frameH - boxSize);
+
+    initTrackerAt(x, y, boxSize, boxSize);
+  }
+
+  function initTrackerAt(x, y, w, h) {
+    resetTracking();
+
+    const rgba = cv.imread(sourceCanvas);
+    const gray = new cv.Mat();
+    cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
+    rgba.delete();
+
+    const mask = cv.Mat.zeros(frameH, frameW, cv.CV_8UC1);
+    const pt1 = new cv.Point(Math.round(x), Math.round(y));
+    const pt2 = new cv.Point(Math.round(x + w), Math.round(y + h));
+    cv.rectangle(mask, pt1, pt2, new cv.Scalar(255), -1);
+
+    const corners = new cv.Mat();
+    cv.goodFeaturesToTrack(gray, corners, 40, 0.01, 7, mask, 7, false, 0.04);
+    mask.delete();
+
+    if (corners.rows === 0) {
+      gray.delete();
+      corners.delete();
+      statusEl.textContent = "Couldn't find enough detail there — try a more textured spot";
+      return;
+    }
+
+    prevGray = gray;
+    prevPts = corners;
+    tracking = true;
+    statusEl.textContent = 'Tracking…';
+
+    updateCropTowards({ x, y, w, h });
+  }
+  </script>
+</body>
+</html>
