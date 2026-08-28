@@ -93,6 +93,7 @@
     <canvas id="display"></canvas>
   </div>
   <div id="status">Loading vision engine…</div>
+  <div id="zoomCapability" style="font-size:12px;color:#8b93a1;text-align:center;margin-top:2px;"></div>
 
   <div class="controls">
     <div class="row">
@@ -154,6 +155,7 @@
   const displayCtx = displayCanvas.getContext('2d');
 
   const statusEl = document.getElementById('status');
+  const zoomCapabilityEl = document.getElementById('zoomCapability');
   const startBtn = document.getElementById('startBtn');
   const flipBtn = document.getElementById('flipBtn');
   const resetBtn = document.getElementById('resetBtn');
@@ -228,8 +230,11 @@
     }
   }
 
-  zoomInBtn.addEventListener('click', () => setManualZoom(manualZoom + 0.5));
-  zoomOutBtn.addEventListener('click', () => setManualZoom(manualZoom - 0.5));
+  function zoomStep() {
+    return Math.max(0.1, (MAX_MANUAL_ZOOM - MIN_MANUAL_ZOOM) / 20);
+  }
+  zoomInBtn.addEventListener('click', () => setManualZoom(manualZoom + zoomStep()));
+  zoomOutBtn.addEventListener('click', () => setManualZoom(manualZoom - zoomStep()));
 
   fullscreenBtn.addEventListener('click', async () => {
     try {
@@ -276,7 +281,12 @@
     try {
       // First choice: ask for the requested facing camera specifically.
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: facingMode }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1920 }, height: { ideal: 1080 },
+          zoom: true // non-standard hint — ignored harmlessly where unsupported, but on
+                     // some Chrome/Android builds this is needed to expose zoom capability
+        },
         audio: false
       });
     } catch (err1) {
@@ -296,14 +306,25 @@
 
       currentTrack = stream.getVideoTracks()[0];
       hasHardwareZoom = false;
+      let diagMsg = '';
       try {
-        const caps = currentTrack.getCapabilities ? currentTrack.getCapabilities() : null;
-        if (caps && caps.zoom) {
-          hasHardwareZoom = true;
-          hwZoomMin = caps.zoom.min;
-          hwZoomMax = caps.zoom.max;
+        if (!currentTrack.getCapabilities) {
+          diagMsg = 'This browser doesn\'t expose camera capabilities — digital zoom only.';
+        } else {
+          const caps = currentTrack.getCapabilities();
+          if (caps && caps.zoom && caps.zoom.max > caps.zoom.min) {
+            hasHardwareZoom = true;
+            hwZoomMin = caps.zoom.min;
+            hwZoomMax = caps.zoom.max;
+            diagMsg = `Optical/hardware zoom available: ${hwZoomMin}x–${hwZoomMax}x (this engages your phone's real lens switching)`;
+          } else {
+            diagMsg = 'No hardware zoom control exposed on this camera/browser — using digital crop only.';
+          }
         }
-      } catch (e) { /* zoom capability not supported here — digital crop only */ }
+      } catch (e) {
+        diagMsg = 'Zoom capability check failed — using digital crop only.';
+      }
+      zoomCapabilityEl.textContent = diagMsg;
 
       MAX_MANUAL_ZOOM = hasHardwareZoom ? hwZoomMax : DIGITAL_MAX_ZOOM;
       setManualZoom(1);
