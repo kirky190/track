@@ -97,7 +97,7 @@
   </div>
   <div id="status">Loading vision engine…</div>
   <div id="zoomCapability" style="font-size:12px;color:#8b93a1;text-align:center;margin-top:2px;"></div>
-  <div style="font-size:10px;color:#4b5563;text-align:center;margin-top:2px;">build v6</div>
+  <div style="font-size:10px;color:#4b5563;text-align:center;margin-top:2px;">build v7</div>
 
   <div class="controls">
     <div class="row">
@@ -199,13 +199,16 @@
   let tracking = false;
   let prevGray = null;   // cv.Mat, kept between frames — lives in ANALYSIS space
   let prevPts = null;    // cv.Mat (Nx1 CV_32FC2), kept between frames — ANALYSIS space
+  let trackWin = null;   // {left, top, w, h} in SOURCE space — the fixed analysis window for the current tracking session
   let lastBox = null;    // last known bounding box, in SOURCE pixel coords
 
   // Optical flow runs on a downscaled copy of each frame — full-resolution
   // tracking is far more CPU than a phone browser can sustain smoothly.
   // analysisScale maps SOURCE pixel coords -> ANALYSIS pixel coords.
   const ANALYSIS_MAX_DIM = 400;
-  let analysisScale = 1;
+  // NOTE: analysis is drawn from the CURRENT crop region each call (not a
+  // fixed global scale) — see stepOpticalFlow/initTrackerAt — so effective
+  // detection resolution scales with zoom instead of degrading at high zoom.
   const analysisCanvas = document.createElement('canvas');
   const analysisCtx = analysisCanvas.getContext('2d', { willReadFrequently: true });
 
@@ -354,9 +357,12 @@
       sourceCanvas.width = frameW;
       sourceCanvas.height = frameH;
 
-      analysisScale = Math.min(1, ANALYSIS_MAX_DIM / Math.max(frameW, frameH));
-      analysisCanvas.width = Math.round(frameW * analysisScale);
-      analysisCanvas.height = Math.round(frameH * analysisScale);
+      // Analysis canvas is a fixed resolution budget for feature detection —
+      // but WHAT part of the source frame gets drawn into it changes every
+      // call (see stepOpticalFlow/initTrackerAt), tracking whatever's
+      // currently zoomed into. That's what keeps detail available at high zoom.
+      analysisCanvas.width = ANALYSIS_MAX_DIM;
+      analysisCanvas.height = Math.round(ANALYSIS_MAX_DIM * (frameH / frameW));
 
       const stageAspect = frameW / frameH;
       displayCanvas.width = 640;
@@ -398,6 +404,7 @@
   function resetTracking() {
     tracking = false;
     lastBox = null;
+    trackWin = null;
     frameCounter = 0;
     if (prevGray) { prevGray.delete(); prevGray = null; }
     if (prevPts) { prevPts.delete(); prevPts = null; }
@@ -441,8 +448,76 @@
     requestAnimationFrame(tick);
   }
 
+  function clampWindowToFrame(win) {
+    win.w = Math.min(win.w, frameW);
+    win.h = Math.min(win.h, frameH);
+    win.left = clamp(win.left, 0, frameW - win.w);
+    win.top = clamp(win.top, 0, frameH - win.h);
+    return win;
+  }
+
+  /** Builds a generous SOURCE-space window around a point — big enough for the object to move in before we need to recentre. */
+  function computeWindowAround(cx, cy, minSize) {
+    const aspect = frameW / frameH;
+    const w = clamp(minSize, frameW * 0.05, frameW);
+    const h = w / aspect;
+    return clampWindowToFrame({ left: cx - w / 2, top: cy - h / 2, w, h });
+  }
+
+  function drawAnalysisFromWindow(win) {
+    analysisCtx.drawImage(sourceCanvas, win.left, win.top, win.w, win.h, 0, 0, analysisCanvas.width, analysisCanvas.height);
+  }
+
+  /**
+   * (Re)seeds tracking: picks a fresh analysis window around (x,y), finds
+   * trackable features inside a box of `boxSize` centred there, and resets
+   * prevGray/prevPts/trackWin to match. Used both for the initial tap and
+   * for silent re-centring later (see stepOpticalFlow) — in both cases we're
+   * starting a fresh optical-flow "session" from a single current frame, so
+   * there's no prevGray/currGray mismatch risk here.
+   */
+  function seedTrackingAt(x, y, boxSize) {
+    const cx = x + boxSize / 2, cy = y + boxSize / 2;
+    const win = computeWindowAround(cx, cy, boxSize * 8);
+    drawAnalysisFromWindow(win);
+
+    const rgba = cv.imread(analysisCanvas);
+    const gray = new cv.Mat();
+    cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
+    rgba.delete();
+
+    const scaleX = analysisCanvas.width / win.w;
+    const scaleY = analysisCanvas.height / win.h;
+    const ax = (x - win.left) * scaleX;
+    const ay = (y - win.top) * scaleY;
+    const aw = boxSize * scaleX;
+    const ah = boxSize * scaleY;
+
+    const mask = cv.Mat.zeros(analysisCanvas.height, analysisCanvas.width, cv.CV_8UC1);
+    cv.rectangle(mask, new cv.Point(ax, ay), new cv.Point(ax + aw, ay + ah), new cv.Scalar(255), -1);
+
+    const corners = new cv.Mat();
+    cv.goodFeaturesToTrack(gray, corners, 30, 0.01, 5, mask, 5, false, 0.04);
+    mask.delete();
+
+    if (corners.rows === 0) {
+      gray.delete();
+      corners.delete();
+      return false;
+    }
+
+    if (prevGray) prevGray.delete();
+    if (prevPts) prevPts.delete();
+    prevGray = gray;
+    prevPts = corners;
+    trackWin = win;
+    return true;
+  }
+
   function stepOpticalFlow() {
-    analysisCtx.drawImage(sourceCanvas, 0, 0, analysisCanvas.width, analysisCanvas.height);
+    if (!trackWin) return null;
+
+    drawAnalysisFromWindow(trackWin);
     const rgba = cv.imread(analysisCanvas);
     const currGray = new cv.Mat();
     cv.cvtColor(rgba, currGray, cv.COLOR_RGBA2GRAY);
@@ -464,14 +539,16 @@
     }
 
     prevGray.delete();
-    prevGray = currGray;
     prevPts.delete();
     nextPts.delete();
     status.delete();
     err.delete();
 
     if (good.length < 4) {
+      prevGray = null;
       prevPts = null;
+      trackWin = null;
+      currGray.delete();
       return null;
     }
 
@@ -480,17 +557,40 @@
     const minX = Math.min(...xs), maxX = Math.max(...xs);
     const minY = Math.min(...ys), maxY = Math.max(...ys);
 
+    // Convert this window's ANALYSIS-space box back to SOURCE pixel coords.
+    const scaleX = trackWin.w / analysisCanvas.width;
+    const scaleY = trackWin.h / analysisCanvas.height;
+    const box = {
+      x: trackWin.left + minX * scaleX,
+      y: trackWin.top + minY * scaleY,
+      w: Math.max((maxX - minX) * scaleX, 10),
+      h: Math.max((maxY - minY) * scaleY, 10)
+    };
+
+    prevGray = currGray;
     const flat = [];
     good.forEach(p => flat.push(p[0], p[1]));
     prevPts = cv.matFromArray(good.length, 1, cv.CV_32FC2, flat);
 
-    // Convert ANALYSIS-space box back to SOURCE pixel coords.
-    const inv = 1 / analysisScale;
-    return {
-      x: minX * inv, y: minY * inv,
-      w: Math.max((maxX - minX) * inv, 10),
-      h: Math.max((maxY - minY) * inv, 10)
-    };
+    // If the object has drifted close to the window edge, or the window is
+    // now a poor fit for its size, silently recentre — a fresh single-frame
+    // reseed, not an optical-flow step, so it's safe to change window here.
+    const margin = 0.12;
+    const cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+    const nearEdge =
+      (cx - trackWin.left) < trackWin.w * margin ||
+      (trackWin.left + trackWin.w - cx) < trackWin.w * margin ||
+      (cy - trackWin.top) < trackWin.h * margin ||
+      (trackWin.top + trackWin.h - cy) < trackWin.h * margin;
+    const sizeMismatch = Math.max(box.w, box.h) > trackWin.w * 0.6 || Math.max(box.w, box.h) < trackWin.w * 0.03;
+
+    if (nearEdge || sizeMismatch) {
+      seedTrackingAt(box.x, box.y, Math.max(box.w, box.h, 20));
+      // If reseeding fails to find features, tracking will naturally end
+      // next frame (trackWin unchanged is fine — we just keep this box).
+    }
+
+    return box;
   }
 
   function updateCropTowards(box) {
@@ -626,34 +726,14 @@
   function initTrackerAt(x, y, w, h) {
     resetTracking();
 
-    analysisCtx.drawImage(sourceCanvas, 0, 0, analysisCanvas.width, analysisCanvas.height);
-    const rgba = cv.imread(analysisCanvas);
-    const gray = new cv.Mat();
-    cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
-    rgba.delete();
+    const boxSize = Math.max(w, h);
+    const ok = seedTrackingAt(x, y, boxSize);
 
-    // Convert the tapped SOURCE-space box into ANALYSIS-space for feature detection.
-    const ax = x * analysisScale, ay = y * analysisScale;
-    const aw = w * analysisScale, ah = h * analysisScale;
-
-    const mask = cv.Mat.zeros(analysisCanvas.height, analysisCanvas.width, cv.CV_8UC1);
-    const pt1 = new cv.Point(Math.round(ax), Math.round(ay));
-    const pt2 = new cv.Point(Math.round(ax + aw), Math.round(ay + ah));
-    cv.rectangle(mask, pt1, pt2, new cv.Scalar(255), -1);
-
-    const corners = new cv.Mat();
-    cv.goodFeaturesToTrack(gray, corners, 30, 0.01, 5, mask, 5, false, 0.04);
-    mask.delete();
-
-    if (corners.rows === 0) {
-      gray.delete();
-      corners.delete();
+    if (!ok) {
       statusEl.textContent = "Couldn't find enough detail there — try a more textured spot";
       return;
     }
 
-    prevGray = gray;
-    prevPts = corners;
     tracking = true;
     lastBox = { x, y, w, h };
     statusEl.textContent = 'Tracking…';
