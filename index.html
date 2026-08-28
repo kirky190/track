@@ -13,6 +13,7 @@
     --muted: #8b93a1;
   }
   * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body {
     margin: 0;
     background: var(--bg);
@@ -61,6 +62,8 @@
     min-width: 110px;
   }
   button.primary { background: var(--accent); color: #0b0d10; font-weight: 600; border: none; }
+  button.zoom-btn { flex: none; min-width: 52px; font-size: 20px; font-weight: 700; }
+  .zoom-readout { flex: 1; text-align: center; align-self: center; font-size: 14px; color: var(--muted); }
   .slider-row { margin-bottom: 10px; }
   .slider-row label {
     display: flex;
@@ -70,6 +73,16 @@
     margin-bottom: 2px;
   }
   input[type="range"] { width: 100%; }
+
+  /* Landscape: put the video and controls side-by-side, video takes most
+     of the width, controls become a scrollable side panel. */
+  @media (orientation: landscape) {
+    body { flex-direction: row; align-items: flex-start; padding: 8px; gap: 8px; }
+    h1 { display: none; }
+    #stage { max-width: none; flex: 1 1 auto; height: calc(100vh - 16px); aspect-ratio: auto; }
+    #status { position: absolute; bottom: 8px; left: 8px; right: 8px; margin: 0; background: rgba(0,0,0,0.5); border-radius: 6px; padding: 4px; }
+    .controls { max-width: 260px; height: calc(100vh - 16px); overflow-y: auto; margin-top: 0; flex: none; }
+  }
 </style>
 </head>
 <body>
@@ -86,6 +99,13 @@
       <button id="startBtn" class="primary">Start camera</button>
       <button id="flipBtn">Switch camera</button>
       <button id="resetBtn">Reset tracking</button>
+    </div>
+
+    <div class="row">
+      <button id="zoomOutBtn" class="zoom-btn">−</button>
+      <span class="zoom-readout" id="zoomReadout">1.0x</span>
+      <button id="zoomInBtn" class="zoom-btn">+</button>
+      <button id="fullscreenBtn">Fullscreen</button>
     </div>
 
     <div class="slider-row">
@@ -137,6 +157,10 @@
   const startBtn = document.getElementById('startBtn');
   const flipBtn = document.getElementById('flipBtn');
   const resetBtn = document.getElementById('resetBtn');
+  const zoomInBtn = document.getElementById('zoomInBtn');
+  const zoomOutBtn = document.getElementById('zoomOutBtn');
+  const zoomReadout = document.getElementById('zoomReadout');
+  const fullscreenBtn = document.getElementById('fullscreenBtn');
 
   const targetFractionEl = document.getElementById('targetFraction');
   const panSmoothingEl = document.getElementById('panSmoothing');
@@ -184,6 +208,35 @@
 
   // Crop window in SOURCE pixel coordinates.
   let crop = { left: 0, top: 0, w: 0, h: 0 };
+
+  // Manual zoom — user-controlled multiplier, on top of whatever
+  // tracking wants (or centred on frame when nothing is being tracked).
+  const MIN_MANUAL_ZOOM = 1;
+  const MAX_MANUAL_ZOOM = 8;
+  let manualZoom = 1;
+
+  function setManualZoom(z) {
+    manualZoom = clamp(z, MIN_MANUAL_ZOOM, MAX_MANUAL_ZOOM);
+    zoomReadout.textContent = manualZoom.toFixed(1) + 'x';
+  }
+
+  zoomInBtn.addEventListener('click', () => setManualZoom(manualZoom + 0.5));
+  zoomOutBtn.addEventListener('click', () => setManualZoom(manualZoom - 0.5));
+
+  fullscreenBtn.addEventListener('click', async () => {
+    try {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+      }
+      if (screen.orientation && screen.orientation.lock) {
+        await screen.orientation.lock('landscape').catch(() => {});
+      }
+    } catch (e) {
+      // Fullscreen/orientation lock isn't available on every browser
+      // (notably iOS Safari) — the CSS landscape layout still applies
+      // if the user just rotates the phone manually.
+    }
+  });
 
   function onOpenCvLoad() {
     cv['onRuntimeInitialized'] = () => {
@@ -305,6 +358,17 @@
         resetTracking();
         box = null;
       }
+    } else if (!tracking) {
+      // Idle manual zoom: centre-crop the frame according to manualZoom.
+      const aspect = frameW / frameH;
+      const minCropW = frameW * parseFloat(minCropFractionEl.value);
+      const targetW = clamp(frameW / manualZoom, minCropW, frameW);
+      const targetH = targetW / aspect;
+      crop = {
+        left: (frameW - targetW) / 2,
+        top: (frameH - targetH) / 2,
+        w: targetW, h: targetH
+      };
     }
 
     render(box);
@@ -371,7 +435,7 @@
     const pa = parseFloat(panSmoothingEl.value);
 
     const boxSize = Math.max(box.w, box.h);
-    const desiredW = clamp(boxSize / targetFrac, minCropW, frameW);
+    const desiredW = clamp(boxSize / targetFrac / manualZoom, minCropW, frameW);
     const desiredCx = box.x + box.w / 2;
     const desiredCy = box.y + box.h / 2;
 
@@ -415,14 +479,62 @@
     }
   }
 
-  // ---- Tap / click to select an object -----------------------------------
-  displayCanvas.addEventListener('pointerdown', onTap);
+  // ---- Tap to select an object, pinch to manually zoom -------------------
+  const activePointers = new Map(); // pointerId -> {x, y}
+  let pinchStartDist = null;
+  let pinchStartZoom = 1;
+  let isPinching = false;
+  let tapCandidate = null; // {x, y, t} — cleared if it turns into a pinch
 
-  function onTap(e) {
+  displayCanvas.addEventListener('pointerdown', (e) => {
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (activePointers.size === 1) {
+      tapCandidate = { x: e.clientX, y: e.clientY, t: performance.now() };
+    } else if (activePointers.size === 2) {
+      isPinching = true;
+      tapCandidate = null;
+      pinchStartDist = pointerDistance();
+      pinchStartZoom = manualZoom;
+    }
+  });
+
+  displayCanvas.addEventListener('pointermove', (e) => {
+    if (!activePointers.has(e.pointerId)) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (isPinching && activePointers.size >= 2) {
+      const dist = pointerDistance();
+      if (pinchStartDist > 0) {
+        setManualZoom(pinchStartZoom * (dist / pinchStartDist));
+      }
+    }
+  });
+
+  function endPointer(e) {
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) {
+      isPinching = false;
+      pinchStartDist = null;
+    }
+    if (activePointers.size === 0 && tapCandidate) {
+      const dt = performance.now() - tapCandidate.t;
+      if (dt < 350) onTap(tapCandidate.x, tapCandidate.y);
+      tapCandidate = null;
+    }
+  }
+  displayCanvas.addEventListener('pointerup', endPointer);
+  displayCanvas.addEventListener('pointercancel', endPointer);
+
+  function pointerDistance() {
+    const pts = [...activePointers.values()];
+    if (pts.length < 2) return 0;
+    return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+  }
+
+  function onTap(clientX, clientY) {
     if (!streaming || !cvReady) return;
     const rect = displayCanvas.getBoundingClientRect();
-    const viewX = ((e.clientX - rect.left) / rect.width) * displayCanvas.width;
-    const viewY = ((e.clientY - rect.top) / rect.height) * displayCanvas.height;
+    const viewX = ((clientX - rect.left) / rect.width) * displayCanvas.width;
+    const viewY = ((clientY - rect.top) / rect.height) * displayCanvas.height;
 
     const scaleX = crop.w / displayCanvas.width;
     const scaleY = crop.h / displayCanvas.height;
