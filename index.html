@@ -190,11 +190,31 @@
       return;
     }
     stopStream();
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      statusEl.textContent = 'This browser has no camera API available — try opening this page directly in Chrome or Safari (not an in-app/embedded browser).';
+      return;
+    }
+
+    let stream;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      // First choice: ask for the requested facing camera specifically.
+      stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false
       });
+    } catch (err1) {
+      try {
+        // Fallback: some browsers/devices reject the facingMode constraint
+        // even when a camera exists — ask for literally any camera instead.
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      } catch (err2) {
+        statusEl.textContent = describeCameraError(err2);
+        return;
+      }
+    }
+
+    try {
       video.srcObject = stream;
       await video.play();
 
@@ -213,8 +233,25 @@
       statusEl.textContent = 'Tap an object to track it';
       requestAnimationFrame(tick);
     } catch (err) {
-      statusEl.textContent = 'Camera error: ' + err.message;
+      statusEl.textContent = describeCameraError(err);
     }
+  }
+
+  function describeCameraError(err) {
+    const name = err && err.name;
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      return "No camera found. If you're in an app's built-in browser (GitHub, a share sheet, etc.) copy this link and open it in Chrome or Safari directly — embedded browsers often can't see the camera.";
+    }
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+      return 'Camera permission was blocked. Check your browser (or the OS app permission for it) allows camera access for this site, then reload.';
+    }
+    if (name === 'NotReadableError' || name === 'TrackStartError') {
+      return 'Camera is busy — close any other app currently using it, then try again.';
+    }
+    if (name === 'OverconstrainedError') {
+      return "Camera doesn't support the requested settings — try Switch camera, or reload and try again.";
+    }
+    return 'Camera error: ' + (err && err.message ? err.message : err);
   }
 
   function stopStream() {
