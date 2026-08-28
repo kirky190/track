@@ -186,6 +186,9 @@
   let streaming = false;
   let facingMode = 'environment'; // back camera by default
   let frameW = 0, frameH = 0;
+  let currentTrack = null;
+  let hasHardwareZoom = false;
+  let hwZoomMin = 1, hwZoomMax = 1;
 
   let tracking = false;
   let prevGray = null;   // cv.Mat, kept between frames — lives in ANALYSIS space
@@ -212,12 +215,17 @@
   // Manual zoom — user-controlled multiplier, on top of whatever
   // tracking wants (or centred on frame when nothing is being tracked).
   const MIN_MANUAL_ZOOM = 1;
-  const MAX_MANUAL_ZOOM = 8;
+  const DIGITAL_MAX_ZOOM = 15; // digital-crop-only ceiling, used when hardware zoom isn't available
+  let MAX_MANUAL_ZOOM = DIGITAL_MAX_ZOOM;
   let manualZoom = 1;
 
   function setManualZoom(z) {
     manualZoom = clamp(z, MIN_MANUAL_ZOOM, MAX_MANUAL_ZOOM);
-    zoomReadout.textContent = manualZoom.toFixed(1) + 'x';
+    zoomReadout.textContent = manualZoom.toFixed(1) + 'x' + (hasHardwareZoom ? ' optical' : '');
+    if (hasHardwareZoom && currentTrack) {
+      const target = clamp(manualZoom, hwZoomMin, hwZoomMax);
+      currentTrack.applyConstraints({ advanced: [{ zoom: target }] }).catch(() => {});
+    }
   }
 
   zoomInBtn.addEventListener('click', () => setManualZoom(manualZoom + 0.5));
@@ -268,7 +276,7 @@
     try {
       // First choice: ask for the requested facing camera specifically.
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: facingMode }, width: { ideal: 960 }, height: { ideal: 540 } },
+        video: { facingMode: { ideal: facingMode }, width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false
       });
     } catch (err1) {
@@ -285,6 +293,20 @@
     try {
       video.srcObject = stream;
       await video.play();
+
+      currentTrack = stream.getVideoTracks()[0];
+      hasHardwareZoom = false;
+      try {
+        const caps = currentTrack.getCapabilities ? currentTrack.getCapabilities() : null;
+        if (caps && caps.zoom) {
+          hasHardwareZoom = true;
+          hwZoomMin = caps.zoom.min;
+          hwZoomMax = caps.zoom.max;
+        }
+      } catch (e) { /* zoom capability not supported here — digital crop only */ }
+
+      MAX_MANUAL_ZOOM = hasHardwareZoom ? hwZoomMax : DIGITAL_MAX_ZOOM;
+      setManualZoom(1);
 
       frameW = video.videoWidth;
       frameH = video.videoHeight;
@@ -360,9 +382,12 @@
       }
     } else if (!tracking) {
       // Idle manual zoom: centre-crop the frame according to manualZoom.
+      // If hardware zoom is driving the actual lens, the incoming video
+      // is already zoomed in — don't crop again on top of that.
       const aspect = frameW / frameH;
       const minCropW = frameW * parseFloat(minCropFractionEl.value);
-      const targetW = clamp(frameW / manualZoom, minCropW, frameW);
+      const digitalZoom = hasHardwareZoom ? 1 : manualZoom;
+      const targetW = clamp(frameW / digitalZoom, minCropW, frameW);
       const targetH = targetW / aspect;
       crop = {
         left: (frameW - targetW) / 2,
@@ -435,7 +460,8 @@
     const pa = parseFloat(panSmoothingEl.value);
 
     const boxSize = Math.max(box.w, box.h);
-    const desiredW = clamp(boxSize / targetFrac / manualZoom, minCropW, frameW);
+    const digitalZoom = hasHardwareZoom ? 1 : manualZoom;
+    const desiredW = clamp(boxSize / targetFrac / digitalZoom, minCropW, frameW);
     const desiredCx = box.x + box.w / 2;
     const desiredCy = box.y + box.h / 2;
 
@@ -480,55 +506,60 @@
   }
 
   // ---- Tap to select an object, pinch to manually zoom -------------------
-  const activePointers = new Map(); // pointerId -> {x, y}
+  // Native touch events, not Pointer Events — multi-touch (pinch) is far
+  // more reliably reported this way across mobile browsers.
   let pinchStartDist = null;
   let pinchStartZoom = 1;
   let isPinching = false;
   let tapCandidate = null; // {x, y, t} — cleared if it turns into a pinch
 
-  displayCanvas.addEventListener('pointerdown', (e) => {
-    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (activePointers.size === 1) {
-      tapCandidate = { x: e.clientX, y: e.clientY, t: performance.now() };
-    } else if (activePointers.size === 2) {
+  function touchDistance(touches) {
+    if (touches.length < 2) return 0;
+    return Math.hypot(
+      touches[0].clientX - touches[1].clientX,
+      touches[0].clientY - touches[1].clientY
+    );
+  }
+
+  displayCanvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      tapCandidate = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: performance.now() };
+      isPinching = false;
+    } else if (e.touches.length >= 2) {
       isPinching = true;
       tapCandidate = null;
-      pinchStartDist = pointerDistance();
+      pinchStartDist = touchDistance(e.touches);
       pinchStartZoom = manualZoom;
     }
-  });
+  }, { passive: false });
 
-  displayCanvas.addEventListener('pointermove', (e) => {
-    if (!activePointers.has(e.pointerId)) return;
-    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (isPinching && activePointers.size >= 2) {
-      const dist = pointerDistance();
-      if (pinchStartDist > 0) {
-        setManualZoom(pinchStartZoom * (dist / pinchStartDist));
-      }
+  displayCanvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (isPinching && e.touches.length >= 2 && pinchStartDist > 0) {
+      const dist = touchDistance(e.touches);
+      setManualZoom(pinchStartZoom * (dist / pinchStartDist));
     }
-  });
+  }, { passive: false });
 
-  function endPointer(e) {
-    activePointers.delete(e.pointerId);
-    if (activePointers.size < 2) {
+  function onTouchEnd(e) {
+    e.preventDefault();
+    if (e.touches.length < 2) {
       isPinching = false;
       pinchStartDist = null;
     }
-    if (activePointers.size === 0 && tapCandidate) {
+    if (e.touches.length === 0 && tapCandidate) {
       const dt = performance.now() - tapCandidate.t;
       if (dt < 350) onTap(tapCandidate.x, tapCandidate.y);
       tapCandidate = null;
     }
   }
-  displayCanvas.addEventListener('pointerup', endPointer);
-  displayCanvas.addEventListener('pointercancel', endPointer);
+  displayCanvas.addEventListener('touchend', onTouchEnd, { passive: false });
+  displayCanvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
 
-  function pointerDistance() {
-    const pts = [...activePointers.values()];
-    if (pts.length < 2) return 0;
-    return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-  }
+  // Desktop/mouse fallback (for testing on a laptop) — click to select,
+  // no pinch equivalent, use the +/- buttons instead.
+  displayCanvas.addEventListener('click', (e) => onTap(e.clientX, e.clientY));
 
   function onTap(clientX, clientY) {
     if (!streaming || !cvReady) return;
@@ -541,7 +572,10 @@
     const srcX = crop.left + viewX * scaleX;
     const srcY = crop.top + viewY * scaleY;
 
-    const boxSize = Math.max(frameW * 0.12, 50);
+    // Size the selection box relative to what's currently ON SCREEN
+    // (crop.w), not the full source frame — otherwise at high zoom this
+    // box would cover most of the visible view and grab the wrong thing.
+    const boxSize = Math.max(crop.w * 0.12, 24);
     const x = clamp(srcX - boxSize / 2, 0, frameW - boxSize);
     const y = clamp(srcY - boxSize / 2, 0, frameH - boxSize);
 
